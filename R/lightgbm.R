@@ -7,6 +7,7 @@
 #'
 #' @param x A data frame or matrix of predictors
 #' @param y A vector (factor or numeric) or matrix (numeric) of outcome data.
+#' @param weights A numeric vector of sample weights.
 #' @param max_depth An integer for the maximum depth of the tree.
 #' @param num_iterations An integer for the number of boosting iterations.
 #' @param learning_rate A numeric value between zero and one to control the learning rate.
@@ -35,7 +36,7 @@
 #' @return A fitted `lightgbm.Model` object.
 #' @keywords internal
 #' @export
-train_lightgbm <- function(x, y, max_depth = -1, num_iterations = 100, learning_rate = 0.1,
+train_lightgbm <- function(x, y, weights = NULL, max_depth = -1, num_iterations = 100, learning_rate = 0.1,
                            feature_fraction_bynode = 1, min_data_in_leaf = 20,
                            min_gain_to_split = 0, bagging_fraction = 1,
                            early_stopping_round = NULL, validation = 0,
@@ -44,9 +45,18 @@ train_lightgbm <- function(x, y, max_depth = -1, num_iterations = 100, learning_
   force(x)
   force(y)
 
-  if (!is.logical(quiet)) {
-    rlang::abort("'quiet' should be a logical value.")
-  }
+  call <- call2("fit")
+
+  check_number_whole(max_depth, call = call)
+  check_number_whole(num_iterations, call = call)
+  check_number_decimal(learning_rate, call = call)
+  check_number_decimal(feature_fraction_bynode, call = call)
+  check_number_whole(min_data_in_leaf, call = call)
+  check_number_decimal(min_gain_to_split, call = call)
+  check_number_decimal(bagging_fraction, call = call)
+  check_number_decimal(early_stopping_round, allow_null = TRUE, call = call)
+  check_bool(counts, call = call)
+  check_bool(quiet, call = call)
 
   feature_fraction_bynode <-
     process_mtry(feature_fraction_bynode = feature_fraction_bynode,
@@ -54,49 +64,42 @@ train_lightgbm <- function(x, y, max_depth = -1, num_iterations = 100, learning_
 
   check_lightgbm_aliases(...)
 
-  args <- list(
-    param = list(
+  # bonsai should be able to differentiate between
+  # 1) main arguments to `lgb.train()` (as in `names(formals(lgb.train))` other
+  #    than `params`),
+  # 2) main arguments to `lgb.Dataset()` (as in `names(formals(lgb.Dataset))`
+  #    other than `params`), and
+  # 3) arguments to pass to `lgb.train(params)` OR `lgb.Dataset(params)`.
+  #    arguments to the `params` argument of either function can be concatenated
+  #    together and passed to both (#77).
+  args <-
+    list(
       num_iterations = num_iterations,
       learning_rate = learning_rate,
       max_depth = max_depth,
       feature_fraction_bynode = feature_fraction_bynode,
       min_data_in_leaf = min_data_in_leaf,
       min_gain_to_split = min_gain_to_split,
-      bagging_fraction = bagging_fraction
-    ),
-    main = list(
+      bagging_fraction = bagging_fraction,
       early_stopping_round = early_stopping_round,
       ...
     )
-  )
 
+  args <- process_bagging(args)
+  args <- process_parallelism(args)
   args <- process_objective_function(args, x, y)
+
+  args <- sort_args(args)
 
   if (!is.numeric(y)) {
     y <- as.numeric(y) - 1
   }
 
-  args <- process_parallelism(args)
+  args <- process_data(args, x, y, weights, validation, missing(validation))
 
-  args <- process_bagging(args, ...)
+  compacted <- c(list(params = args$params), args$main_args_train)
 
-  args <- process_data(args, x, y, validation, missing(validation),
-                       early_stopping_round)
-
-  args <- sort_args(args)
-
-  if (!"verbose" %in% names(args$main)) {
-    args$main$verbose <- 1L
-  }
-
-  compacted <-
-    c(
-      list(param = args$param),
-      args$main[names(args$main) != "data"],
-      list(data = quote(args$main$data))
-    )
-
-  call <- parsnip::make_call(fun = "lgb.train", ns = "lightgbm", compacted)
+  call <- rlang::call2("lgb.train", !!!compacted, .ns = "lightgbm")
 
   if (quiet) {
     junk <- utils::capture.output(res <- rlang::eval_tidy(call, env = rlang::current_env()))
@@ -107,39 +110,25 @@ train_lightgbm <- function(x, y, max_depth = -1, num_iterations = 100, learning_
   res
 }
 
-process_mtry <- function(feature_fraction_bynode, counts, x, is_missing) {
-  if (!is.logical(counts)) {
-    rlang::abort("'counts' should be a logical value.")
-  }
+process_mtry <- function(feature_fraction_bynode, counts, x, is_missing, call = call2("fit")) {
+  check_bool(counts, call = call)
 
   ineq <- if (counts) {"greater"} else {"less"}
   interp <- if (counts) {"count"} else {"proportion"}
   opp <- if (!counts) {"count"} else {"proportion"}
 
   if ((feature_fraction_bynode < 1 & counts) | (feature_fraction_bynode > 1 & !counts)) {
-    rlang::abort(
-      glue::glue(
-        "The supplied argument `mtry = {feature_fraction_bynode}` must be ",
-        "{ineq} than or equal to 1. \n\n`mtry` is currently being interpreted ",
-        "as a {interp} rather than a {opp}. Supply `counts = {!counts}` to ",
-        "`set_engine` to supply this argument as a {opp} rather than ",
-        # TODO: link to parsnip's lightgbm docs instead here
-        "a {interp}. \n\nSee `?train_lightgbm` for more details."
+    cli::cli_abort(
+      c(
+        "{.arg mtry} must be {ineq} than or equal to 1, not {feature_fraction_bynode}.",
+        "i" = "{.arg mtry} is currently being interpreted as a {interp}
+               rather than a {opp}.",
+        "i" = "Supply {.code counts = {!counts}} to {.fn set_engine} to supply
+               this argument as a {opp} rather than a {interp}.",
+        "i" = "See {.help train_lightgbm} for more details."
       ),
-      call = NULL
+      call = call
     )
-  }
-
-  if (rlang::is_call(feature_fraction_bynode)) {
-    if (rlang::call_name(feature_fraction_bynode) == "tune") {
-      rlang::abort(
-        glue::glue(
-          "The supplied `mtry` parameter is a call to `tune`. Did you forget ",
-          "to optimize hyperparameters with a tuning function like `tune::tune_grid`?"
-        ),
-        call = NULL
-      )
-    }
   }
 
   if (counts && !is_missing) {
@@ -151,25 +140,21 @@ process_mtry <- function(feature_fraction_bynode, counts, x, is_missing) {
 
 process_objective_function <- function(args, x, y) {
   # set the "objective" param argument, clear it out from main args
-  if (!any(names(args$main) %in% c("objective"))) {
+  if (!any(names(args) %in% c("objective"))) {
     if (is.numeric(y)) {
-      args$param$objective <- "regression"
+      args$objective <- "regression"
     } else {
       lvl <- levels(y)
       lvls <- length(lvl)
       if (lvls == 2) {
-        args$param$num_class <- 1
-        args$param$objective <- "binary"
+        args$num_class <- 1
+        args$objective <- "binary"
       } else {
-        args$param$num_class <- lvls
-        args$param$objective <- "multiclass"
+        args$num_class <- lvls
+        args$objective <- "multiclass"
       }
     }
-  } else {
-    args$param$objective <- args$main$objective
   }
-
-  args$main$objective <- NULL
 
   args
 }
@@ -177,25 +162,24 @@ process_objective_function <- function(args, x, y) {
 # supply the number of threads as num_threads in params, clear out
 # any other thread args that might be passed as main arguments
 process_parallelism <- function(args) {
-  if (!is.null(args$main["num_threads"])) {
-    args$param$num_threads <- args$main[names(args$main) == "num_threads"]
-    args$main[names(args$main) == "num_threads"] <- NULL
+  if (!is.null(args["num_threads"])) {
+    args$num_threads <- args[names(args) == "num_threads"]
+    args[names(args) == "num_threads"] <- NULL
   }
 
   args
 }
 
-process_bagging <- function(args, ...) {
-  if (args$param$bagging_fraction != 1 &&
-      (!"bagging_freq" %in% names(list(...)))) {
-    args$param$bagging_freq <- 1
+process_bagging <- function(args) {
+  if (args$bagging_fraction != 1 &&
+      (!"bagging_freq" %in% names(args))) {
+    args$bagging_freq <- 1
   }
 
   args
 }
 
-process_data <- function(args, x, y, validation, missing_validation,
-                         early_stopping_round) {
+process_data <- function(args, x, y, weights, validation, missing_validation) {
   #                                           trn_index       | val_index
   #                                         ----------------------------------
   #  needs_validation &  missing_validation | 1:n               1:n
@@ -204,7 +188,12 @@ process_data <- function(args, x, y, validation, missing_validation,
   # !needs_validation & !missing_validation | sample(1:n, m)    setdiff(trn_index, 1:n)
 
   n <- nrow(x)
-  needs_validation <- !is.null(early_stopping_round)
+  needs_validation <- !is.null(args$params$early_stopping_round)
+  if (!needs_validation) {
+    # If early_stopping_round isn't set, clear it from arguments actually
+    # passed to LightGBM.
+    args$params$early_stopping_round <- NULL
+  }
 
   if (missing_validation) {
     trn_index <- 1:n
@@ -219,57 +208,84 @@ process_data <- function(args, x, y, validation, missing_validation,
     val_index <- setdiff(1:n, trn_index)
   }
 
-  args$main$data <-
-    lightgbm::lgb.Dataset(
-      data = prepare_df_lgbm(x[trn_index, , drop = FALSE]),
-      label = y[trn_index],
-      categorical_feature = categorical_columns(x[trn_index, , drop = FALSE]),
-      params = list(feature_pre_filter = FALSE)
+  data_args <-
+    c(
+      list(
+        data = prepare_df_lgbm(x[trn_index, , drop = FALSE]),
+        label = y[trn_index],
+        categorical_feature = categorical_columns(x[trn_index, , drop = FALSE]),
+        params = c(list(feature_pre_filter = FALSE), args$params),
+        weight = weights[trn_index]
+      ),
+      args$main_args_dataset
+    )
+
+  args$main_args_train$data <-
+    rlang::eval_bare(
+      rlang::call2("lgb.Dataset", !!!data_args, .ns = "lightgbm")
     )
 
   if (!is.null(val_index)) {
-    args$main$valids <-
-      list(validation =
-          lightgbm::lgb.Dataset(
+    valids_args <-
+      c(
+        list(
           data = prepare_df_lgbm(x[val_index, , drop = FALSE]),
           label = y[val_index],
           categorical_feature = categorical_columns(x[val_index, , drop = FALSE]),
-          params = list(feature_pre_filter = FALSE)
-        )
+          params = list(feature_pre_filter = FALSE, args$params),
+          weight = weights[val_index]
+        ),
+        args$main_args_dataset
+      )
+
+    args$main_args_train$valids <-
+      list(
+        validation =
+          rlang::eval_bare(
+            rlang::call2("lgb.Dataset", !!!valids_args, .ns = "lightgbm")
+          )
       )
   }
 
   args
 }
 
-# transfers arguments between param and main arguments
+# identifies supplied arguments as destined for `lgb.Dataset()`, `lgb.train()`,
+# or the `params` argument to both of the above (#77).
 sort_args <- function(args) {
   # warn on arguments that won't be passed along
   protected <- c("obj", "init_model", "colnames",
                  "categorical_feature", "callbacks", "reset_data")
 
-  if (any(names(args$main) %in% protected)) {
-    protected_args <- names(args$main[names(args$main) %in% protected])
+  if (any(names(args) %in% protected)) {
+    protected_args <- names(args[names(args) %in% protected])
 
     rlang::warn(
       glue::glue(
         "The following argument(s) are guarded by bonsai and will not ",
-        "be passed to `lgb.train`: {glue::glue_collapse(protected_args, sep = ', ')}"
+        "be passed to LightGBM: {glue::glue_collapse(protected_args, sep = ', ')}"
       )
     )
 
-    args$main[protected_args] <- NULL
+    args[protected_args] <- NULL
   }
 
-  # dots are deprecated in lgb.train -- pass to param instead
-  to_main   <- c("nrounds", "eval", "verbose", "record", "eval_freq",
-                 "early_stopping_round", "data", "valids")
+  main_args_dataset <- main_args(lightgbm::lgb.Dataset)
+  main_args_train <- main_args(lightgbm::lgb.train)
 
-  args$param <- c(args$param, args$main[!names(args$main) %in% to_main])
-
-  args$main[!names(args$main) %in% to_main] <- NULL
+  args <-
+    list(
+      main_args_dataset = args[names(args) %in% main_args_dataset],
+      main_args_train = args[names(args) %in% main_args_train],
+      params = args[!names(args) %in% c(main_args_dataset, main_args_train)]
+    )
 
   args
+}
+
+main_args <- function(fn) {
+  res <- names(formals(fn))
+  res[res != "params"]
 }
 
 # in lightgbm <= 3.3.2, predict() for multiclass classification produced a single
@@ -352,7 +368,9 @@ predict_lightgbm_regression_numeric <- function(object, new_data, ...) {
 #' @rdname lightgbm_helpers
 multi_predict._lgb.Booster <- function(object, new_data, type = NULL, trees = NULL, ...) {
   if (any(names(rlang::enquos(...)) == "newdata")) {
-    rlang::abort("Did you mean to use `new_data` instead of `newdata`?")
+    cli::cli_abort(
+      "Did you mean to use {.code new_data} instead of {.code newdata}?"
+    )
   }
 
   trees <- sort(trees)
@@ -399,13 +417,16 @@ prepare_df_lgbm <- function(x, y = NULL) {
 
   x <- categorical_features_to_int(x, categorical_cols)
 
-  x <- as.matrix(x)
+  x <- parsnip::maybe_matrix(x)
 
   return(x)
 }
 
 categorical_columns <- function(x){
   categorical_cols <- NULL
+  if (inherits(x, c("matrix", "Matrix"))) {
+    return(categorical_cols)
+  }
   for (i in seq_along(x)) {
     if (is.factor(x[[i]])) {
       categorical_cols <- c(categorical_cols, i)
@@ -415,6 +436,9 @@ categorical_columns <- function(x){
 }
 
 categorical_features_to_int <- function(x, cat_indices){
+  if (inherits(x, c("matrix", "Matrix"))) {
+    return(x)
+  }
   for (i in cat_indices){
     x[[i]] <- as.integer(x[[i]]) -1
   }

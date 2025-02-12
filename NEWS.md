@@ -1,6 +1,26 @@
-# bonsai 0.2.1.9000 (developmental version)
+# bonsai (development version)
 
-v0.2.1.9000 is a developmental version of the bonsai package.
+# bonsai 0.3.2
+
+* Resolves a test failure ahead of an upcoming parsnip release (#95).
+
+* lightgbm models can now accept sparse matrices for training and prediction (#91).
+
+# bonsai 0.3.1
+
+* Fixed bug where `"aorsf"` models would not successfully fit in socket cluster workers (i.e. with `plan(multisession)`) unless another engine requiring bonsai had been fitted in the worker (#85).
+
+# bonsai 0.3.0
+
+* Introduced support for accelerated oblique random forests for the `"classification"` and `"regression"` modes using the new [`"aorsf"` engine](https://github.com/ropensci/aorsf) (#78 by `@bcjaeger`). 
+
+* Enabled passing [Dataset Parameters](https://lightgbm.readthedocs.io/en/latest/Parameters.html#dataset-parameters) to the `"lightgbm"` engine. To pass an argument that would be usually passed as an element to the `param` argument in `lightgbm::lgb.Dataset()`, pass the argument directly through the ellipses in `set_engine()`, e.g. `boost_tree() %>% set_engine("lightgbm", linear_tree = TRUE)` (#77).
+
+* Enabled case weights with the `"lightgbm"` engine (#72 by `@p-schaefer`).
+
+* Fixed issues in metadata for the `"partykit"` engine for `rand_forest()` where some engine arguments were mistakenly protected (#74).
+
+* Addressed type check error when fitting lightgbm model specifications with arguments mistakenly left as `tune()` (#79).
 
 # bonsai 0.2.1
 
